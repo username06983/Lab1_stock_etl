@@ -73,7 +73,6 @@ def predict(db, schema, forecast_function_name,
     forecast_tbl = f"{db}.{schema}.{forecast_table}"
     final_tbl    = f"{db}.{schema}.{final_table}"
 
-    # 1) Make predictions and persist them
     make_prediction_sql = f"""BEGIN
         CALL {forecast_fn}!FORECAST(
             FORECASTING_PERIODS => 7,
@@ -84,7 +83,6 @@ def predict(db, schema, forecast_function_name,
             SELECT * FROM TABLE(RESULT_SCAN(:x));
     END;"""
 
-    # 2) Create final unioned table (same columns / types as your original)
     create_final_table_sql = f"""CREATE OR REPLACE TABLE {final_tbl} AS
         SELECT SYMBOL, DATE, CLOSE AS actual,
                NULL::FLOAT AS forecast, NULL::FLOAT AS lower_bound, NULL::FLOAT AS upper_bound
@@ -127,14 +125,12 @@ with DAG(
   db = extras.get("database")
   schema = "STOCKS"
 
-  # Unqualified object names (functions/tables) — functions add db.schema themselves
   train_input_table      = "STOCK_PRICE"
   forecast_table         = "STOCK_PRICE_FORECAST_7D"
   forecast_function_name = "PREDICT_STOCK_PRICE"
   final_table            = "STOCK_PRICE_PLUS_FORECAST"
 
 
-  # Pass (cur, db, schema, ...) to match function signatures
   train_task = train(db, schema, forecast_function_name)
   predict_task = predict(db, schema,
                         forecast_function_name,
