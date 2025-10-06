@@ -114,7 +114,7 @@ def load(records: list):
 with DAG(
     dag_id="Stocks_data_ETL",
     start_date=days_ago(1),
-    schedule="00 13 * * *",
+    schedule="00 3 * * *",
     catchup=False,
     tags=["ETL"],
 ) as dag:
