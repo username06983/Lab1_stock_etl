@@ -28,7 +28,7 @@ def return_snowflake_conn():
 
 @task
 def extract():
-  ticker_symbols = ["MSFT", "AAPL"]
+  ticker_symbols = [s.strip() for s in Variable.get("yfinance_tickets").split(",")]
 
   stock_data = yf.download(ticker_symbols, period="180d", interval="1d")
   stock_data = (stock_data.stack(level=1)
