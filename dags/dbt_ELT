@@ -1,0 +1,199 @@
+"""
+BuildELT_dbt: run dbt (run → test → snapshot) and then merge into CORE.PRICES.
+- Credentials/env pulled from Airflow connection: snowflake_conn
+- profiles.yml + dbt_project.yml live in: /opt/airflow/dbt/lab2
+"""
+
+from pendulum import datetime
+from airflow import DAG
+from airflow.operators.bash import BashOperator
+from airflow.operators.python import PythonOperator
+from airflow.hooks.base import BaseHook
+from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
+
+
+DBT_DIR = "/opt/airflow/dbt/lab2"
+
+# ---- pull connection + build safe env dict (never None) ----
+conn = BaseHook.get_connection("snowflake_conn")
+def _s(v):  # str-or-empty
+    return "" if v is None else str(v)
+
+default_env = {
+    "DBT_USER": _s(conn.login),
+    "DBT_PASSWORD": _s(conn.password),
+    "DBT_ACCOUNT": _s(conn.extra_dejson.get("account")),
+    "DBT_SCHEMA": _s(conn.schema or conn.extra_dejson.get("schema") or "ANALYTICS"),
+    "DBT_DATABASE": _s(conn.extra_dejson.get("database")),
+    "DBT_ROLE": _s(conn.extra_dejson.get("role")),
+    "DBT_WAREHOUSE": _s(conn.extra_dejson.get("warehouse")),
+    "DBT_TYPE": "snowflake",
+}
+
+with DAG(
+    dag_id="BuildELT_dbt",
+    description="Run dbt models via Airflow on Snowflake, then merge into CORE.PRICES",
+    start_date=datetime(2025, 11, 14),
+    schedule="@daily",
+    catchup=False,
+    tags=["dbt", "elt", "snowflake"],
+) as dag:
+
+    # quick sanity: print the env vars Airflow is passing to dbt
+    show_env = BashOperator(
+        task_id="show_env",
+        bash_command="env | grep DBT_ || true",
+        env=default_env,
+    )
+
+    # dbt run / test / snapshot
+    dbt_run = BashOperator(
+        task_id="dbt_run",
+        bash_command=(
+            f"set -euxo pipefail; "
+            f"/home/airflow/.local/bin/dbt run "
+            f"--project-dir {DBT_DIR} --profiles-dir {DBT_DIR}"
+        ),
+        env=default_env,
+    )
+
+    dbt_test = BashOperator(
+        task_id="dbt_test",
+        bash_command=(
+            f"set -euxo pipefail; "
+            f"/home/airflow/.local/bin/dbt test "
+            f"--project-dir {DBT_DIR} --profiles-dir {DBT_DIR}"
+        ),
+        env=default_env,
+    )
+
+    dbt_snapshot = BashOperator(
+        task_id="dbt_snapshot",
+        bash_command=(
+            f"set -euxo pipefail; "
+            f"/home/airflow/.local/bin/dbt snapshot "
+            f"--project-dir {DBT_DIR} --profiles-dir {DBT_DIR}"
+        ),
+        env=default_env,
+    )
+
+def create_stg_prices():
+    """Create and populate the staging table from STOCKS.STOCK_PRICE."""
+    hook = SnowflakeHook(snowflake_conn_id="snowflake_conn")
+    conn = hook.get_connection("snowflake_conn")
+    sf = hook.get_conn()
+    cur = sf.cursor()
+    try:
+        role = (conn.extra_dejson.get("role") or "").upper()
+        wh   = (conn.extra_dejson.get("warehouse") or "").upper()
+        db   = (conn.extra_dejson.get("database") or "").upper()
+        schema = (conn.extra_dejson.get("target_schema") or "ANALYTICS").upper()
+
+        if role:
+            cur.execute(f'USE ROLE "{role}"')
+        if wh:
+            cur.execute(f'USE WAREHOUSE "{wh}"')
+        cur.execute(f'USE DATABASE "{db}"')
+        cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{db}"."{schema}"')
+
+        # CREATE OR REPLACE to populate with data
+        cur.execute(f"""
+            CREATE OR REPLACE TABLE "{db}"."{schema}"."STG_PRICES" AS
+            SELECT 
+                SYMBOL,
+                DATE AS DT,
+                OPEN,
+                HIGH,
+                LOW,
+                CLOSE,
+                VOLUME
+            FROM "{db}"."STOCKS"."STOCK_PRICE"
+        """)
+        sf.commit()
+    finally:
+        cur.close()
+        sf.close()
+
+create_stg_task = PythonOperator(
+    task_id="create_stg_prices",
+    python_callable=create_stg_prices,
+)
+
+    
+# merge step (idempotent) – uses connection settings
+    
+def merge_prices_to_core(**_):
+    hook = SnowflakeHook(snowflake_conn_id="snowflake_conn")
+    conn = hook.get_connection("snowflake_conn")  # Airflow Connection object
+    sf = hook.get_conn()                          # Snowflake connector connection
+    sf.autocommit = False
+    cur = sf.cursor()
+    try:
+        # ---- pull context from the Airflow connection ----
+        role = (conn.extra_dejson.get("role") or "").upper()
+        wh   = (conn.extra_dejson.get("warehouse") or "").upper()
+
+        # IMPORTANT: database must come from extras; do not fall back to conn.schema
+        db = (conn.extra_dejson.get("database") or "").upper()
+        if not db:
+            raise ValueError("Snowflake 'database' must be set in the connection extras.")
+
+        # target (where we upsert) and source (where we read from)
+        # target (upsert) and source (read) locations
+        target_schema = (conn.extra_dejson.get("target_schema") or "ANALYTICS").upper()
+
+# If stg_prices is a dbt model, it lives in ANALYTICS by default
+        source_schema = (conn.extra_dejson.get("source_schema") or "ANALYTICS").upper()
+        source_table  = (conn.extra_dejson.get("source_table")  or "STG_PRICES").upper()
+
+        full_source = f'"{db}"."{source_schema}"."{source_table}"'
+
+        if role:
+            cur.execute(f'USE ROLE "{role}"')
+        if wh:
+            cur.execute(f'USE WAREHOUSE "{wh}"')
+        cur.execute(f'USE DATABASE "{db}"')
+
+        # ensure target schema/table exist
+        cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{db}"."{target_schema}"')
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS "{db}"."{target_schema}".PRICES (
+              SYMBOL STRING,
+              DT DATE,
+              OPEN FLOAT, HIGH FLOAT, LOW FLOAT, CLOSE FLOAT, VOLUME NUMBER,
+              CONSTRAINT PK_PRICES PRIMARY KEY (SYMBOL, DT)
+            );
+        """)
+
+
+        # MERGE from RAW.STG_PRICES (or whatever you set as source_table) into ANALYTICS.PRICES
+        cur.execute(f"""
+            MERGE INTO "{db}"."{target_schema}".PRICES AS tgt
+            USING {full_source} AS src
+              ON tgt.SYMBOL = src.SYMBOL AND tgt.DT = src.DT
+            WHEN MATCHED THEN UPDATE SET
+              OPEN = src.OPEN,
+              HIGH = src.HIGH,
+              LOW  = src.LOW,
+              CLOSE = src.CLOSE,
+              VOLUME = src.VOLUME
+            WHEN NOT MATCHED THEN INSERT (SYMBOL, DT, OPEN, HIGH, LOW, CLOSE, VOLUME)
+              VALUES (src.SYMBOL, src.DT, src.OPEN, src.HIGH, src.LOW, src.CLOSE, src.VOLUME);
+        """)
+
+        sf.commit()
+    except Exception:
+        sf.rollback()
+        raise
+    finally:
+        cur.close()
+        sf.close()
+
+merge_prices = PythonOperator(
+    task_id="merge_prices",
+    python_callable=merge_prices_to_core,
+)
+
+# order
+show_env >> dbt_run >> dbt_test >> create_stg_task >> merge_prices >> dbt_snapshot
+
