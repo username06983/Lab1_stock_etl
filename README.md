@@ -12,6 +12,6 @@ BI Tool
 * The dashboard is built using the dbt transformed table.
 
 Files:
-Airflow DAGs → dags/
-dbt models → lab2/models/
-dbt snapshots → lab2/snapshot/
+* Airflow DAGs → dags/
+* dbt models → lab2/models/
+* dbt snapshots → lab2/snapshot/
